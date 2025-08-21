@@ -2,79 +2,97 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="Email Campaign Projections", layout="wide")
+st.set_page_config(page_title="CLM Budget Projections", layout="wide")
 
-st.title("📩 Email Campaigns – Historical Data & Projections")
+st.title("📩 CLM Budget Projections – Email, SMS, WA")
 
 # --- File uploader ---
-uploaded_file = st.file_uploader("Upload your monthly performance CSV (with columns: Month, Emails Sent, Visits, Orders, CR%, Revenue, AOV, Cost, CPO)", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload your Excel file with WA, SMS, Email sheets", type=["xlsx"])
 
 if uploaded_file:
-    # Read file
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+    xls = pd.ExcelFile(uploaded_file)
 
-    # Clean & format
-    df.columns = df.columns.str.strip()
-    df['Month'] = pd.to_datetime(df['Month'], errors='coerce')
-    df = df.sort_values('Month')
+    # Load sheets
+    sheets = {s: pd.read_excel(uploaded_file, sheet_name=s) for s in xls.sheet_names if s in ["WA","SMS","Email"]}
 
-    st.subheader("📊 Historical Data Preview")
-    st.dataframe(df.tail(12))
+    st.sidebar.header("Projection Settings")
+    growth_targets = [43, 51, 75]
 
-    # --- YoY Growth Calculation ---
-    df['Year'] = df['Month'].dt.year
-    df['Month_Num'] = df['Month'].dt.month
+    channel_outputs = {}
 
-    # Pivot for YoY comparison
-    pivot = df.pivot(index='Month_Num', columns='Year', values='Emails Sent')
-    st.write("### Year-on-Year Sends Trend")
-    st.line_chart(pivot)
+    for channel, df in sheets.items():
+        st.subheader(f"📊 {channel} Historical Data Preview")
+        st.dataframe(df.head())
 
-    # --- Projection Logic ---
-    st.subheader("📈 Projection Settings")
-    growth_type = st.radio("Projection method:", ["Simple Avg Growth", "CAGR", "Last Year Copy"])
+        # --- Normalize metrics per channel ---
+        if channel == "Email":
+            df.columns = df.iloc[0]
+            df = df.drop(0)
+            df = df.rename(columns={"MONTH":"Month","Emails Sent":"Sends","Revenue(INR)":"Revenue","COST":"Cost"})
+            df = df[["Month","Sends","Revenue","Cost"]]
 
-    years_available = df['Year'].unique()
-    base_year = st.selectbox("Base Year for projection", sorted(years_available, reverse=True))
+        elif channel == "SMS":
+            df = df.rename(columns={"Month":"Month","Submitted":"Sends","Revenue":"Revenue","Cost":"Cost"})
+            df = df[["Month","Sends","Revenue","Cost"]]
 
-    future_year = base_year + 1
-    st.markdown(f"**Projecting for {future_year}**")
+        elif channel == "WA":
+            df = df.rename(columns={"Month":"Month","Total Delivered":"Sends","Total Revenue":"Revenue","Cost":"Cost"})
+            df = df[["Month","Sends","Revenue","Cost"]]
 
-    proj_df = df[df['Year'] == base_year].copy()
-    proj_df['Year'] = future_year
+        # Convert numeric
+        for c in ["Sends","Revenue","Cost"]:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    if growth_type == "Simple Avg Growth":
-        avg_growth = df.groupby('Month_Num')['Emails Sent'].pct_change().mean()
-        proj_df['Emails Sent'] = proj_df['Emails Sent'] * (1 + avg_growth)
-    elif growth_type == "CAGR":
-        first = df.groupby('Month_Num').first()['Emails Sent']
-        last = df.groupby('Month_Num').last()['Emails Sent']
-        n = len(years_available) - 1
-        cagr = (last / first) ** (1/n) - 1
-        proj_df['Emails Sent'] = proj_df['Month_Num'].map(lambda m: proj_df.loc[proj_df['Month_Num']==m, 'Emails Sent'] * (1 + cagr[m]))
-    else:
-        # Just copy last year
-        proj_df['Emails Sent'] = proj_df['Emails Sent']
+        # --- Compute ROI & revenue per send ---
+        roi = (df["Revenue"].sum() / df["Cost"].sum()) if df["Cost"].sum() > 0 else 0
+        rev_per_send = (df["Revenue"].sum() / df["Sends"].sum()) if df["Sends"].sum() > 0 else 0
 
-    # Project dependent metrics using simple ratios
-    order_rate = (df['Orders'].sum() / df['Emails Sent'].sum()) if 'Orders' in df else 0.002
-    revenue_per_order = (df['Revenue'].sum() / df['Orders'].sum()) if 'Revenue' in df else 1500
+        # --- Last FY Sep–Mar seasonality ---
+        fy_df = df.tail(18)  # last 1.5 years approx
+        fy_df = fy_df[fy_df["Month"].str.contains("Sep|Oct|Nov|Dec|Jan|Feb|Mar", case=False, regex=True)]
+        seasonality = fy_df[["Month","Sends"]].copy()
+        seasonality["Weight"] = seasonality["Sends"] / seasonality["Sends"].sum()
 
-    proj_df['Orders'] = (proj_df['Emails Sent'] * order_rate).astype(int)
-    proj_df['Revenue'] = (proj_df['Orders'] * revenue_per_order).round()
-    proj_df['CR%'] = (proj_df['Orders'] / proj_df['Emails Sent'] * 100).round(2)
+        # --- Projection base (Aug actuals + growth target) ---
+        total_ytd_growth = 0.43  # baseline achieved till Aug
+        base_revenue = df["Revenue"].sum()
 
-    st.subheader("🔮 Projected Data")
-    st.dataframe(proj_df[['Month','Emails Sent','Orders','Revenue','CR%']])
+        scenarios = {}
+        for g in growth_targets:
+            target_growth = g/100
+            required_rev = base_revenue * (target_growth/total_ytd_growth)
+            extra_rev = required_rev - base_revenue
+            extra_cost = extra_rev / roi if roi > 0 else 0
+            extra_sends = extra_rev / rev_per_send if rev_per_send > 0 else 0
 
-    st.line_chart(proj_df.set_index('Month')[['Emails Sent','Orders','Revenue']])
+            # Allocate by seasonality
+            alloc = seasonality.copy()
+            alloc["Projected_Sends"] = alloc["Weight"] * extra_sends
+            alloc["Projected_Cost"] = alloc["Weight"] * extra_cost
+            alloc["Projected_Revenue"] = alloc["Projected_Cost"] * roi
+            alloc["ROI"] = roi
 
-    # --- Export option ---
-    csv = proj_df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Projection CSV", csv, f"projection_{future_year}.csv", "text/csv")
+            scenarios[g] = alloc
+
+        channel_outputs[channel] = scenarios
+
+        # --- Show tables ---
+        for g, alloc in scenarios.items():
+            st.write(f"### {channel} – {g}% Growth Projection")
+            st.dataframe(alloc[["Month","Projected_Sends","Projected_Cost","Projected_Revenue","ROI"]])
+
+    # --- Combine into CSV ---
+    all_records = []
+    for ch, scenarios in channel_outputs.items():
+        for g, alloc in scenarios.items():
+            temp = alloc.copy()
+            temp["Channel"] = ch
+            temp["GrowthScenario"] = g
+            all_records.append(temp)
+    result = pd.concat(all_records)
+
+    csv = result.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download All Projections", csv, "CLM_Projections.csv", "text/csv")
 
 else:
-    st.info("👆 Upload a CSV/Excel file to start.")
+    st.info("👆 Upload the projections Excel to start.")
